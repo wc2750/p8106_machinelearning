@@ -1,0 +1,276 @@
+---
+title: "p8106_midterm_wc2750"
+author: "Weixi Chen"
+date: "3/28/2021"
+output: html_document
+---
+
+```{r setup, message = FALSE}
+library(tidyverse)
+library(visdat)
+library(corrplot)
+library(RColorBrewer)
+library(reshape2)
+library(caret)
+library(mgcv)
+library(glmnet)
+library(nlme)
+library(earth)
+library(Formula)
+library(plotmo)
+library(plotrix)
+library(TeachingDemos)
+library(mlbench)
+library(pROC)
+library(vip)
+```
+
+## Introduction
+```{r message = F}
+# import and tidy data
+heart_df_miss = read_csv("data/framingham.csv") %>%
+  janitor::clean_names()
+```
+
+```{r}
+# check missing data
+vis_miss(heart_df_miss)
+# glucose variable have 9.16% missing data, need to preprocess
+```
+
+```{r}
+# correlation map to find if glucose has close correlated variable
+# correlation matrix cannot have na
+heart_df_cor = heart_df_miss %>%
+  drop_na()
+heart_cor = cor(heart_df_cor)
+corrplot(heart_cor, type="upper", order="hclust",
+         tl.col = "black", tl.srt = 45,
+         col=brewer.pal(n=8, name="RdYlBu"))
+```
+
+```{r}
+# missing data preprocess on glucose variable based on diabetes variable by bagImp method
+heart_df_glucose = heart_df_miss %>%
+  select(glucose, diabetes)
+
+set.seed(2021)
+bagImp = preProcess(heart_df_glucose, method = "bagImpute")
+heart_df_bag = predict(bagImp, heart_df_glucose)
+```
+
+```{r}
+heart_df_nomiss = heart_df_miss %>%
+  # add in the non-missing glucose variable column
+  mutate(glucose = heart_df_bag$glucose) %>%
+  # drop the other missing data since their missing percentages are very small
+  drop_na()
+```
+
+## Exploratory analysis/visualization
+```{r}
+heart_df_eda = heart_df_nomiss %>%
+  # mutate dummy variable
+  mutate(male = ifelse(male == 1, "Yes", "No"),
+         current_smoker = ifelse(current_smoker == 1, "Yes", "No"),
+         bp_meds = ifelse(bp_meds == 1, "Yes", "No"),
+         prevalent_stroke = ifelse(prevalent_stroke == 1, "Yes", "No"),
+         prevalent_hyp = ifelse(prevalent_hyp == 1, "Yes", "No"),
+         diabetes = ifelse(diabetes == 1, "Yes", "No"),
+         ten_year_chd = ifelse(ten_year_chd == 1, "Yes", "No")
+         ) %>%
+  mutate_at(c(1,3,4,6,7,8,9,16), as.factor)
+```
+
+```{r}
+# density plots for continuous variables
+heart_df_continuous = heart_df_eda %>%
+  dplyr::select(age, cigs_per_day, tot_chol, sys_bp, dia_bp, bmi, heart_rate, 
+                glucose, ten_year_chd)
+
+heart_df_con_long = melt(heart_df_continuous, id.vars= "ten_year_chd") 
+
+heart_df_con_long %>%
+  ggplot(aes(x = value, color = ten_year_chd)) +
+  geom_density() +
+  labs(x = "Continuous variables", y = "Density") +
+  facet_wrap(~variable, scales = "free", nrow = 2)
+```
+
+```{r warning = F}
+# bar plots for categorical variables
+heart_df_categorical = heart_df_eda %>%
+  dplyr::select(male, education, current_smoker, bp_meds, prevalent_stroke, 
+                prevalent_hyp, diabetes, ten_year_chd)
+
+heart_df_cate_long = melt(heart_df_categorical, id.vars= "ten_year_chd") 
+
+heart_df_cate_long %>%
+  ggplot(aes(x = value, fill = ten_year_chd)) + 
+  geom_bar(position = "fill") +
+  labs(x = "Categorical variables", y = "Proportion") +
+  facet_wrap(~variable, scales = "free", nrow = 2)
+```
+
+## Models
+Determine and keep significant variables from glm.
+```{r}
+# deal with multicollinearity by removing highly correlated predictors (correlation over 50%)
+# prefer to remove categorical varibales compared to continuous variables since the later ones have higher statistical power
+heart_df = heart_df_nomiss %>%
+  mutate(ten_year_chd = ifelse(ten_year_chd == 1, "Yes", "No")) %>%
+  mutate_at(c(1,3,4,6,7,8,9,16), as.factor) %>%
+  dplyr::select(-current_smoker, -prevalent_hyp, -sys_bp, -diabetes)
+```
+
+```{r}
+# determine significant variables
+glm.fit.sig = glm(ten_year_chd ~ ., 
+                  data = heart_df, 
+                  family = binomial(link = "logit"))
+summary(glm.fit.sig)
+# there are five significant variables, including male, age, cigs_per_day, dia_bp, glucose
+# p-value smaller than 0.01
+```
+
+```{r}
+# create datasets with only significant variables and response variable
+heart_df_sig = heart_df %>%
+  dplyr::select(male, age, cigs_per_day, dia_bp, glucose, ten_year_chd)
+```
+
+```{r}
+# divide into training and test datasets again
+set.seed(2021)
+rowTrain_sig = createDataPartition(y = heart_df_sig$ten_year_chd,
+                                   p = 0.75,
+                                   list = FALSE)
+
+train_df = heart_df_sig[rowTrain_sig, ]
+test_df = heart_df_sig[-rowTrain_sig, ]
+
+x_train = model.matrix(ten_year_chd ~ ., train_df)[,-1]
+x_test = model.matrix(ten_year_chd ~ ., test_df)[,-1]
+
+y_train = train_df$ten_year_chd
+y_test = test_df$ten_year_chd
+```
+
+```{r}
+# fit models by caret in order to compare the cross-validation performance with other models, rather than tuning the model
+ctrl = trainControl(method = "cv",
+                    summaryFunction = twoClassSummary,
+                    classProbs = TRUE)
+```
+
+### GLM
+```{r}
+set.seed(2021)
+model.glm = train(x = x_train,
+                  y = y_train,
+                  method = "glm",
+                  metric = "ROC",
+                  trControl = ctrl)
+```
+
+```{r}
+# results of GLM
+summary(model.glm)
+```
+
+### GAM
+```{r}
+set.seed(2021)
+model.gam = train(x = x_train,
+                  y = y_train,
+                  method = "gam",
+                  metric = "ROC",
+                  trControl = ctrl)
+```
+
+### MARS
+```{r}
+set.seed(2021)
+model.mars = train(x = x_train,
+                   y = y_train,
+                   method = "earth",
+                   tuneGrid = expand.grid(degree = 1:3, nprune = 2:15),
+                   metric = "ROC",
+                   trControl = ctrl)
+```
+
+```{r}
+# tunning parameter of MARS
+plot(model.mars)
+
+# importance of vairables
+vip(model.mars$finalModel)
+```
+
+### KNN
+```{r warning = F}
+set.seed(2021)
+model.knn = train(x = x_train,
+                  y = y_train,
+                  method = "knn",
+                  preProcess = c("center","scale"),
+                  tuneGrid = data.frame(k = seq(1, 250, by = 5)),
+                  trControl = ctrl)
+```
+
+```{r}
+# tuning parameter of KNN
+ggplot(model.knn, highlight = TRUE)
+```
+
+### LDA
+```{r}
+set.seed(2021)
+model.lda = train(x = x_train,
+                  y = y_train,
+                  method = "lda",
+                  metric = "ROC",
+                  trControl = ctrl)
+```
+
+### Compare models
+```{r message = F, warning = F}
+glm.pred = predict(model.glm, newdata = x_test, type = "prob")[,2]
+gam.pred = predict(model.gam, newdata = x_test, type = "prob")[,2]
+mars.pred = predict(model.mars, newdata = x_test, type = "prob")[,2]
+knn.pred = predict(model.knn, newdata = x_test, type = "prob")[,2]
+lda.pred = predict(model.lda, newdata = x_test, type = "prob")[,2]
+
+roc.glm = roc(y_test, glm.pred)
+roc.gam = roc(y_test, gam.pred)
+roc.mars = roc(y_test, mars.pred)
+roc.knn = roc(y_test, knn.pred)
+roc.lda = roc(y_test, lda.pred)
+
+auc = c(roc.glm$auc[1], roc.gam$auc[1], roc.mars$auc[1],
+        roc.knn$auc[1], roc.lda$auc[1])
+
+plot(roc.glm, legacy.axes = TRUE)
+plot(roc.gam, col = 2, add = TRUE)
+plot(roc.mars, col = 3, add = TRUE)
+plot(roc.knn, col = 4, add = TRUE)
+plot(roc.lda, col = 5, add = TRUE)
+
+modelNames = c("glm", "gam", "mars", "knn", "lda")
+legend("bottomright", legend = paste0(modelNames, ": ", round(auc,3)),
+       col = 1:5, lwd = 2)
+```
+
+
+### Best model
+GAM is the best model with the highest ROC.
+```{r}
+summary(model.gam)$p.table %>%
+  as.data.frame() %>%
+  knitr::kable(digits = 3)
+
+summary(model.gam)$s.table
+
+par(mfrow = c(2,2))
+plot(model.gam$finalModel)
+```
